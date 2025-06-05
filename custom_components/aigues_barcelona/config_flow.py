@@ -17,6 +17,7 @@ from homeassistant.exceptions import HomeAssistantError
 from .api import AiguesApiClient
 from .const import API_ERROR_TOKEN_REVOKED
 from .const import CONF_CONTRACT
+from .const import CONF_TWOCAPTCHA_API_KEY
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,6 +26,8 @@ ACCOUNT_CONFIG_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USERNAME): cv.string,
         vol.Required(CONF_PASSWORD): cv.string,
+        vol.Optional(CONF_TWOCAPTCHA_API_KEY): cv.string,
+        vol.Optional(CONF_TOKEN, description="Manual token (optional if using 2Captcha)"): cv.string,
     }
 )
 TOKEN_SCHEMA = vol.Schema({vol.Required(CONF_TOKEN): cv.string})
@@ -57,43 +60,53 @@ async def validate_credentials(
     username = data[CONF_USERNAME]
     password = data[CONF_PASSWORD]
     token = data.get(CONF_TOKEN)
+    twocaptcha_key = data.get(CONF_TWOCAPTCHA_API_KEY)
 
     if not check_valid_nif(username):
         raise InvalidUsername
 
     try:
-        api = AiguesApiClient(username, password)
+        api = AiguesApiClient(username, password, twocaptcha_api_key=twocaptcha_key)
+        
         if token:
+            # Manual token provided
             api.set_token(token)
         else:
-            _LOGGER.info("Attempting to login")
-            login = await hass.async_add_executor_job(api.login)
+            # Use automatic login with 2Captcha
+            if not twocaptcha_key:
+                raise MissingTwoCaptchaKey
+            
+            _LOGGER.info("Attempting automatic login with 2Captcha")
+            login = await hass.async_add_executor_job(api.login_with_recaptcha)
             if not login:
                 raise InvalidAuth
-            _LOGGER.info("Login succeeded!")
+            _LOGGER.info("Automatic login succeeded!")
+            
         contracts = await hass.async_add_executor_job(api.contracts, username)
-
         available_contracts = [x["contractDetail"]["contractNumber"] for x in contracts]
         return {CONF_CONTRACT: available_contracts}
 
-    except Exception:
+    except Exception as exp:
         _LOGGER.debug(f"Last data: {api.last_response}")
-        if not api.last_response:
-            return False
-
-        if (
+        
+        if "insufficient funds" in str(exp).lower():
+            raise InsufficientFunds
+        elif "timeout" in str(exp).lower():
+            raise RecaptchaTimeout
+        elif not api.last_response:
+            raise InvalidAuth
+        elif (
             isinstance(api.last_response, dict)
             and api.last_response.get("path") == "recaptchaClientResponse"
         ):
             raise RecaptchaAppeared
-
-        if (
+        elif (
             isinstance(api.last_response, str)
             and api.last_response == API_ERROR_TOKEN_REVOKED
         ):
             raise TokenExpired
 
-        return False
+        raise InvalidAuth from exp
 
 
 class AiguesBarcelonaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -128,10 +141,30 @@ class AiguesBarcelonaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Return to user step with stored input (previous user creds) and the
-        current provided token."""
+        """Handle reauth with automatic token refresh if 2Captcha is configured."""
 
         if not user_input:
+            # Check if we have 2Captcha configured for automatic reauth
+            if self.stored_input.get(CONF_TWOCAPTCHA_API_KEY):
+                # Try automatic reauth
+                try:
+                    user_input = self.stored_input.copy()
+                    user_input.pop(CONF_TOKEN, None)  # Remove old token
+                    info = await validate_credentials(self.hass, user_input)
+                    
+                    if info:
+                        contracts = info[CONF_CONTRACT]
+                        if contracts == self.stored_input.get(CONF_CONTRACT):
+                            self.hass.config_entries.async_update_entry(self.entry, data=user_input)
+                            self.hass.async_create_task(
+                                self.hass.config_entries.async_reload(self.entry.entry_id)
+                            )
+                            return self.async_abort(reason="reauth_successful")
+                
+                except Exception as exp:
+                    _LOGGER.warning(f"Automatic reauth failed: {exp}")
+                    # Fall back to manual token entry
+            
             return self.async_show_form(
                 step_id="reauth_confirm", data_schema=TOKEN_SCHEMA
             )
@@ -163,6 +196,10 @@ class AiguesBarcelonaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors["base"] = "invalid_auth"
         except InvalidAuth:
             errors["base"] = "invalid_auth"
+        except InsufficientFunds:
+            errors["base"] = "insufficient_funds"
+        except RecaptchaTimeout:
+            errors["base"] = "recaptcha_timeout"
 
         return self.async_show_form(
             step_id="reauth_confirm", data_schema=TOKEN_SCHEMA, errors=errors
@@ -174,7 +211,11 @@ class AiguesBarcelonaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle configuration step from UI."""
         if user_input is None:
             return self.async_show_form(
-                step_id="user", data_schema=ACCOUNT_CONFIG_SCHEMA
+                step_id="user", 
+                data_schema=ACCOUNT_CONFIG_SCHEMA,
+                description_placeholders={
+                    "twocaptcha_info": "Get your API key from https://2captcha.com"
+                }
             )
 
         errors = {}
@@ -191,6 +232,12 @@ class AiguesBarcelonaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
         except NotImplementedError:
             errors["base"] = "not_implemented"
+        except MissingTwoCaptchaKey:
+            errors["base"] = "missing_twocaptcha_key"
+        except InsufficientFunds:
+            errors["base"] = "insufficient_funds"
+        except RecaptchaTimeout:
+            errors["base"] = "recaptcha_timeout"
         except TokenExpired:
             errors["base"] = "token_expired"
             return self.async_show_form(
@@ -237,3 +284,15 @@ class InvalidAuth(HomeAssistantError):
 
 class InvalidUsername(HomeAssistantError):
     """Error to indicate invalid username."""
+
+
+class MissingTwoCaptchaKey(HomeAssistantError):
+    """Error to indicate 2Captcha API key is missing."""
+
+
+class InsufficientFunds(HomeAssistantError):
+    """Error to indicate insufficient funds in 2Captcha account."""
+
+
+class RecaptchaTimeout(HomeAssistantError):
+    """Error to indicate reCAPTCHA solving timeout."""

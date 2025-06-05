@@ -2,11 +2,16 @@ import base64
 import datetime
 import json
 import logging
+from typing import TypedDict
 
 import requests
 
 from .const import API_COOKIE_TOKEN
 from .const import API_HOST
+from .const import RECAPTCHA_V2_PAGEURL
+from .const import RECAPTCHA_V2_SITEKEY
+from .const import RECAPTCHA_TIMEOUT
+from .const import RECAPTCHA_MAX_RETRIES
 from .version import VERSION
 
 TIMEOUT = 60
@@ -14,9 +19,14 @@ TIMEOUT = 60
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
+class ChallengeResponse(TypedDict):
+    captchaId: str
+    code: str
+
+
 class AiguesApiClient:
     def __init__(
-        self, username, password, contract=None, session: requests.Session = None
+        self, username, password, contract=None, session: requests.Session = None, twocaptcha_api_key=None
     ):
         if session is None:
             session = requests.Session()
@@ -33,6 +43,7 @@ class AiguesApiClient:
         self._username = username
         self._password = password
         self._contract = contract
+        self._twocaptcha_api_key = twocaptcha_api_key
         self.last_response = None
 
     def _generate_url(self, path, query) -> str:
@@ -89,6 +100,48 @@ class AiguesApiClient:
 
         return resp
 
+    def _solve_recaptcha(self) -> str:
+        """Solve reCAPTCHA using 2Captcha service."""
+        if not self._twocaptcha_api_key:
+            raise Exception("2Captcha API key not provided")
+
+        from twocaptcha import TwoCaptcha
+
+        client = TwoCaptcha(self._twocaptcha_api_key)
+        
+        for attempt in range(RECAPTCHA_MAX_RETRIES):
+            try:
+                _LOGGER.info(f"Solving reCAPTCHA attempt {attempt + 1}/{RECAPTCHA_MAX_RETRIES}")
+                response: ChallengeResponse = client.recaptcha(
+                    sitekey=RECAPTCHA_V2_SITEKEY,
+                    url=RECAPTCHA_V2_PAGEURL,
+                    timeout=RECAPTCHA_TIMEOUT
+                )
+                
+                recaptcha_code = response["code"]
+                _LOGGER.info("reCAPTCHA solved successfully")
+                return recaptcha_code
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "insufficient funds" in error_msg or "zero balance" in error_msg:
+                    raise Exception("Insufficient funds in 2Captcha account")
+                elif "timeout" in error_msg:
+                    _LOGGER.warning(f"reCAPTCHA timeout on attempt {attempt + 1}")
+                    if attempt == RECAPTCHA_MAX_RETRIES - 1:
+                        raise Exception("reCAPTCHA solving timeout after multiple attempts")
+                else:
+                    _LOGGER.warning(f"reCAPTCHA solving failed on attempt {attempt + 1}: {e}")
+                    if attempt == RECAPTCHA_MAX_RETRIES - 1:
+                        raise Exception(f"reCAPTCHA solving failed: {e}")
+
+        raise Exception("reCAPTCHA solving failed after maximum retries")
+
+    def login_with_recaptcha(self) -> bool:
+        """Login using automatic reCAPTCHA solving."""
+        recaptcha_response = self._solve_recaptcha()
+        return self.login(recaptcha=recaptcha_response)
+
     def login(self, user=None, password=None, recaptcha=None):
         if user is None:
             user = self._username
@@ -124,6 +177,8 @@ class AiguesApiClient:
             _LOGGER.warning("Access token missing")
             return False
 
+        # Automatically set the token as cookie
+        self.set_token(access_token)
         return True
 
         # set as cookie: ofexTokenJwt

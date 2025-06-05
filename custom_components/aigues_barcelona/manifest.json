@@ -7,7 +7,8 @@
   "config_flow": true,
   "dependencies": [
     "http",
-    "recorder"
+    "recorder",
+    "2captcha-python"
   ],
   "documentation": "https://github.com/duhow/hass-aigues-barcelona/tree/master",
   "integration_type": "hub",
